@@ -5,11 +5,17 @@ var uglify = require('uglify-js');
 
 var fs = require('fs');
 var path = require('path');
+var detective = require('detective');
 
 var combineSourceMap = require('combine-source-map');
 
 var prelude = (function () {
     var src = fs.readFileSync(path.join(__dirname, 'prelude.js'), 'utf8');
+    return uglify(src) + '({';
+})();
+
+var byIndexPrelude = (function () {
+    var src = fs.readFileSync(path.join(__dirname, 'byIndexPrelude.js'), 'utf8');
     return uglify(src) + '({';
 })();
 
@@ -22,6 +28,7 @@ function newlinesIn(src) {
 
 module.exports = function (opts) {
     if (!opts) opts = {};
+    var selectedPrelude = opts.requireByIndex ? byIndexPrelude : prelude;
     var parser = opts.raw ? through() : JSONStream.parse([ true ]);
     var output = through(write, end);
     parser.pipe(output);
@@ -30,31 +37,45 @@ module.exports = function (opts) {
     var entries = [];
     var order = []; 
     
-    var lineno = 1 + newlinesIn(prelude);
+    var lineno = 1 + newlinesIn(selectedPrelude);
     var sourcemap;
 
     return duplexer(parser, output);
     
     function write (row) {
-        if (first) this.queue(prelude);
+        var source = row.source;
+        if (first) this.queue(selectedPrelude);
         
         if (row.sourceFile) { 
             sourcemap = sourcemap || combineSourceMap.create();
             sourcemap.addFile(
-                { sourceFile: row.sourceFile, source: row.source },
+                { sourceFile: row.sourceFile, source: source },
                 { line: lineno }
             );
         }
-        
+
+        // If direct lookups mode is enabled, iterate over the string matches - backwards, so
+        // that locations still match - and replace the matches with the reference.
+        if (opts.requireByIndex) {
+            var i, stringMatch, stringRange, deps = row.deps;
+            var requireMatches = detective.find(source, { ranges: true });
+            for (i = requireMatches.strings.length - 1; i >= 0; i--) {
+                stringMatch = requireMatches.strings[i];
+                stringRange = requireMatches.stringRanges[i];
+                source = source.substring(0, stringRange[0]) + '/* ' + stringMatch + ' */ ' + deps[stringMatch] + source.substring(stringRange[1]);
+            }
+        }
+
         var wrappedSource = [
             (first ? '' : ','),
             JSON.stringify(row.id),
-            ':[',
+            opts.requireByIndex ? ':' : ':[',
             'function(require,module,exports){\n',
-            combineSourceMap.removeComments(row.source),
-            '\n},',
-            JSON.stringify(row.deps || {}),
-            ']'
+            combineSourceMap.removeComments(source),
+            '\n}',
+            opts.requireByIndex ? '' : ',',
+            opts.requireByIndex ? '' : JSON.stringify(row.deps || {}),
+            opts.requireByIndex ? '' : ']'
         ].join('');
 
         this.queue(wrappedSource);
